@@ -1,0 +1,14 @@
+# pgbox backup schedule
+# Install with: sudo crontab examples/crontab.pgbox
+
+# weekly full backup
+0 2 * * 0 /usr/local/bin/pgbox backup full
+
+# daily differential backup
+0 2 * * 1-6 /usr/local/bin/pgbox backup diff
+
+# optional hourly incremental backup
+0 * * * * /usr/local/bin/pgbox backup incr
+
+# doctor report
+15 3 * * * /usr/local/bin/pgbox doctor >> /var/log/pgbox-doctor.log 2>&1

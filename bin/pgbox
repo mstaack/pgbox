@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+PGBOX_VERSION="0.1.0"
+APP_DIR="${PGBOX_APP_DIR:-/opt/pgbox}"
+DATA_DIR="$APP_DIR/data"
+BACKUP_DIR="$APP_DIR/backups"
+SECRETS_DIR="$APP_DIR/secrets"
+STATE_DIR="$APP_DIR/state"
+ENV_FILE="$APP_DIR/.env"
+INFO_FILE="$APP_DIR/PGBOX_INFO.txt"
+STATE_FILE="$STATE_DIR/state.json"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+PG_CONF_DIR="$APP_DIR/postgres-conf"
+PGBR_CONF_DIR="$APP_DIR/pgbackrest-conf"
+PGBR_LOG_DIR="$APP_DIR/pgbackrest-log"
+BIN_PATH="/usr/local/bin/pgbox"
+CONTAINER_NAME_DEFAULT="pgbox-postgres"
+PG_UID="${PGBOX_PG_UID:-999}"  # ponytail: official postgres image uid/gid; set PGBOX_PG_UID for a custom image with a different one
+PGBOX_UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/mstaack/pgbox/main/bin/pgbox"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root."; }
+exists() { command -v "$1" >/dev/null 2>&1; }
+# Emit a KEY='value' line, single-quoting so `source` and compose's dotenv parser
+# read it literally (protects values containing $, spaces, #). Avoid single quotes in secrets.
+env_line() { local q="'" v="$2"; v="${v//$q/$q\\$q$q}"; printf "%s='%s'\n" "$1" "$v"; }
+
+load_env() {
+  [[ -f "$ENV_FILE" ]] || die "Not installed: $ENV_FILE missing. Run: pgbox install"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  : "${PGBOX_CONTAINER_NAME:=$CONTAINER_NAME_DEFAULT}"
+  : "${POSTGRES_IMAGE:=postgres:17}"
+  : "${POSTGRES_DB:=app}"
+  : "${POSTGRES_USER:=app}"
+  : "${BACKUP_MODE:=pgbackrest}"
+  : "${BACKUP_KEEP_FULL:=8}"
+  : "${BACKUP_KEEP_DIFF:=30}"
+  : "${EXPOSE_MODE:=1}"
+  : "${ALLOWED_IPS:=}"
+  : "${PGBOX_UPDATE_URL:=$PGBOX_UPDATE_URL_DEFAULT}"
+  : "${S3_ENABLED:=no}"
+  : "${PGBR_ENCRYPT:=no}"
+  : "${PGBR_CIPHER_PASS:=}"
+}
+
+ask() {
+  local prompt="$1" default="${2:-}" value
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " value
+    printf '%s' "${value:-$default}"
+  else
+    read -r -p "$prompt: " value
+    printf '%s' "$value"
+  fi
+}
+
+ask_secret() {
+  local prompt="$1" value
+  read -r -s -p "$prompt (leave empty to generate): " value
+  echo >&2
+  if [[ -z "$value" ]]; then openssl rand -base64 48; else printf '%s' "$value"; fi
+}
+
+ask_required_secret() {
+  local prompt="$1" value
+  read -r -s -p "$prompt: " value
+  echo >&2
+  printf '%s' "$value"
+}
+
+confirm_or_die() {
+  local phrase="$1" prompt="$2" input
+  read -r -p "$prompt Type $phrase to continue: " input
+  [[ "$input" == "$phrase" ]] || die "Aborted."
+}
+
+install_docker() {
+  # Base packages pgbox itself needs — installed unconditionally so a host that
+  # already has Docker still gets ufw/openssl/curl.
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg ufw openssl cron
+  systemctl enable --now cron 2>/dev/null || true
+  if exists docker && docker compose version >/dev/null 2>&1; then
+    info "Docker already installed."
+    return
+  fi
+  info "Installing Docker from official repository..."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local distro="${ID:-debian}"
+  [[ "$distro" == "debian" || "$distro" == "ubuntu" ]] || die "Unsupported distro '$distro'. Only debian and ubuntu are supported."
+  install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    curl -fsSL "https://download.docker.com/linux/${distro}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  fi
+  cat >/etc/apt/sources.list.d/docker.list <<EOS
+ deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${distro} ${VERSION_CODENAME} stable
+EOS
+  sed -i 's/^ //' /etc/apt/sources.list.d/docker.list
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+}
+
+write_dockerfile() {
+  cat >"$APP_DIR/Dockerfile.postgres-pgbackrest" <<'EOS'
+ARG POSTGRES_IMAGE=postgres:17
+FROM ${POSTGRES_IMAGE}
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pgbackrest ca-certificates tzdata; \
+    rm -rf /var/lib/apt/lists/*
+EOS
+}
+
+write_postgres_conf() {
+  mkdir -p "$PG_CONF_DIR"
+  cat >"$PG_CONF_DIR/pgbox-postgresql.conf" <<'EOS'
+# Managed by pgbox.
+listen_addresses = '*'
+shared_preload_libraries = 'pg_stat_statements'
+wal_level = replica
+archive_mode = on
+archive_command = 'pgbackrest --stanza=main archive-push %p'
+archive_timeout = 60s
+max_wal_senders = 3
+hot_standby = on
+log_min_duration_statement = 1000
+log_checkpoints = on
+log_connections = off
+log_disconnections = off
+EOS
+}
+
+write_pgbackrest_conf() {
+  mkdir -p "$PGBR_CONF_DIR" "$PGBR_LOG_DIR"
+  {
+    cat <<EOS
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=${BACKUP_KEEP_FULL:-8}
+repo1-retention-full-type=count
+repo1-retention-diff=${BACKUP_KEEP_DIFF:-30}
+start-fast=y
+process-max=${PGBR_PROCESS_MAX:-2}
+log-level-console=info
+log-level-file=detail
+compress-type=zst
+compress-level=3
+EOS
+    if [[ "${PGBR_ENCRYPT:-no}" == "yes" ]]; then
+      cat <<EOS
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=${PGBR_CIPHER_PASS}
+EOS
+    fi
+    if [[ "${S3_ENABLED:-no}" == "yes" ]]; then
+      cat <<EOS
+repo2-type=s3
+repo2-path=${S3_PATH:-/pgbox}
+repo2-s3-bucket=${S3_BUCKET}
+repo2-s3-endpoint=${S3_ENDPOINT}
+repo2-s3-region=${S3_REGION:-auto}
+repo2-s3-key=${S3_KEY}
+repo2-s3-key-secret=${S3_KEY_SECRET}
+repo2-s3-uri-style=${S3_URI_STYLE:-path}
+repo2-retention-full=${S3_KEEP_FULL:-${BACKUP_KEEP_FULL:-8}}
+repo2-retention-full-type=count
+EOS
+      if [[ "${PGBR_ENCRYPT:-no}" == "yes" ]]; then
+        cat <<EOS
+repo2-cipher-type=aes-256-cbc
+repo2-cipher-pass=${PGBR_CIPHER_PASS}
+EOS
+      fi
+    fi
+    cat <<EOS
+
+[main]
+pg1-path=/var/lib/postgresql/data/pgdata
+pg1-user=${POSTGRES_USER:-postgres}
+EOS
+  } >"$PGBR_CONF_DIR/pgbackrest.conf"
+  # ponytail: 600 + chowned to PG_UID in fix_perms — readable by the in-container postgres user, holds S3 + cipher secrets
+  chmod 600 "$PGBR_CONF_DIR/pgbackrest.conf"
+}
+
+write_compose() {
+  # ponytail: quoted heredoc — emit literal ${VAR}, let docker compose interpolate from .env
+  cat >"$COMPOSE_FILE" <<'EOS'
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-pgbackrest
+      args:
+        POSTGRES_IMAGE: ${POSTGRES_IMAGE:-postgres:17}
+    image: pgbox-postgres-pgbackrest:local
+    container_name: ${PGBOX_CONTAINER_NAME:-pgbox-postgres}
+    restart: unless-stopped
+    init: true
+    shm_size: "${POSTGRES_SHM_SIZE:-1g}"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: ["postgres", "-c", "config_file=/etc/postgresql/pgbox-postgresql.conf"]
+    secrets:
+      - postgres_password
+    ports:
+      - "${PGBOX_PORT_BINDING:-127.0.0.1:5432:5432}"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./pgbackrest-repo:/var/lib/pgbackrest
+      - ./pgbackrest-conf:/etc/pgbackrest:ro
+      - ./pgbackrest-log:/var/log/pgbackrest
+      - ./postgres-conf/pgbox-postgresql.conf:/etc/postgresql/pgbox-postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+EOS
+}
+
+write_info_file() {
+  cat >"$INFO_FILE" <<EOS
+PGBOX INSTALL INFO
+==================
+Created: $(date -Is)
+Version: $PGBOX_VERSION
+
+Paths:
+  App:      $APP_DIR
+  Data:     $DATA_DIR
+  Backups:  $BACKUP_DIR
+  Env:      $ENV_FILE
+  Secret:   $SECRETS_DIR/postgres_password
+  Compose:  $COMPOSE_FILE
+
+PostgreSQL:
+  Image:    ${POSTGRES_IMAGE:-postgres:17}
+  Database: ${POSTGRES_DB:-app}
+  User:     ${POSTGRES_USER:-app}
+
+Backup:
+  Mode:     ${BACKUP_MODE:-pgbackrest}
+  Full retention count: ${BACKUP_KEEP_FULL:-8}
+  Diff retention count: ${BACKUP_KEEP_DIFF:-30}
+
+Connection:
+  Host from same machine: 127.0.0.1
+  Port: 5432
+
+Network:
+  Mode: ${EXPOSE_MODE:-1}
+  Allowed IPs: ${ALLOWED_IPS:-none / localhost only}
+
+Commands:
+  pgbox help
+  pgbox info
+  pgbox doctor
+  pgbox start
+  pgbox backup full
+  pgbox backups
+  pgbox restore latest
+  pgbox restore time "YYYY-MM-DD HH:MM:SS"
+  pgbox self-update
+
+Keep this file private.
+EOS
+  chmod 600 "$INFO_FILE"
+}
+
+write_state() {
+  mkdir -p "$STATE_DIR"
+  cat >"$STATE_FILE" <<EOS
+{"version":"$PGBOX_VERSION","installed_at":"$(date -Is)","last_restore_test":""}
+EOS
+}
+
+write_cron() {
+  # Managed backup schedule as a cron.d drop-in. Continuous WAL archiving already covers
+  # PITR between backups, so weekly full + daily diff is enough; edit this file to change it.
+  cat >/etc/cron.d/pgbox <<EOS
+# Managed by pgbox — backup schedule. Edit freely; regenerated by 'pgbox reconfigure'.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+0 2 * * 0 root $BIN_PATH backup full >> /var/log/pgbox.log 2>&1
+0 2 * * 1-6 root $BIN_PATH backup diff >> /var/log/pgbox.log 2>&1
+30 * * * * root $BIN_PATH backup incr >> /var/log/pgbox.log 2>&1
+15 3 * * * root $BIN_PATH doctor >> /var/log/pgbox-doctor.log 2>&1
+EOS
+  chmod 644 /etc/cron.d/pgbox
+}
+
+fix_perms() {
+  # The container runs as uid PG_UID; it must own the bind-mounted dirs it reads/writes.
+  # /opt/pgbox itself stays 700 root, so the host filesystem is still private.
+  chown -R "$PG_UID:$PG_UID" "$DATA_DIR" "$BACKUP_DIR" "$APP_DIR/pgbackrest-repo" "$PGBR_LOG_DIR" "$PG_CONF_DIR" "$PGBR_CONF_DIR"
+  chown "$PG_UID:$PG_UID" "$SECRETS_DIR/postgres_password"
+}
+
+configure_firewall() {
+  load_env
+  info "Configuring UFW..."
+  ufw default deny incoming
+  ufw default allow outgoing
+  # Keep SSH reachable. OpenSSH profile if present, else port 22. Custom SSH ports must be opened manually.
+  ufw allow OpenSSH 2>/dev/null || ufw allow 22/tcp
+  if [[ "$EXPOSE_MODE" == "2" ]]; then
+    IFS=',' read -ra IPS <<< "$ALLOWED_IPS"
+    for ip in "${IPS[@]}"; do
+      ip="$(echo "$ip" | xargs)"
+      [[ -n "$ip" ]] && ufw allow from "$ip" to any port 5432 proto tcp
+    done
+  fi
+  ufw --force enable >/dev/null
+}
+
+cmd_install() {
+  require_root
+  [[ ! -f "$ENV_FILE" ]] || die "Already installed at $APP_DIR."
+  install_docker
+  mkdir -p "$APP_DIR" "$DATA_DIR" "$BACKUP_DIR" "$SECRETS_DIR" "$STATE_DIR" "$APP_DIR/pgbackrest-repo"
+  chmod 700 "$SECRETS_DIR"
+
+  bold "PGBOX interactive install"
+  local pg_image db_name db_user pg_password tz expose_mode allowed_ips full_keep diff_keep update_url shm pmax port_binding
+  local s3_enabled s3_bucket s3_endpoint s3_region s3_key s3_secret s3_path s3_uri_style s3_keep_full
+  local encrypt cipher_pass
+  pg_image="$(ask "Postgres image" "postgres:17")"
+  db_name="$(ask "Database name" "app")"
+  db_user="$(ask "Database user" "app")"
+  pg_password="$(ask_secret "Database password")"
+  tz="$(ask "Timezone" "Europe/Berlin")"
+  echo "Network mode: 1) localhost only  2) expose 5432 to selected IPs/CIDRs"
+  expose_mode="$(ask "Choose network mode" "1")"
+  if [[ "$expose_mode" == "2" ]]; then allowed_ips="$(ask "Allowed IPs/CIDRs, comma-separated" "")"; [[ -n "$allowed_ips" ]] || die "Allowed IPs required."; else allowed_ips=""; fi
+  if [[ "$expose_mode" == "2" ]]; then port_binding="0.0.0.0:5432:5432"; else port_binding="127.0.0.1:5432:5432"; fi
+  full_keep="$(ask "pgBackRest full backup retention count" "8")"
+  diff_keep="$(ask "pgBackRest diff backup retention count" "30")"
+  shm="$(ask "Docker shm_size" "1g")"
+  pmax="$(ask "pgBackRest process-max" "2")"
+  update_url="$(ask "Self-update raw script URL" "$PGBOX_UPDATE_URL_DEFAULT")"
+
+  echo "Encrypt backups at rest (AES-256, applies to local + offsite repos; protects data before it leaves the box)."
+  encrypt="$(ask "Encrypt backups? yes/no" "yes")"
+  cipher_pass=""
+  if [[ "$encrypt" == "yes" ]]; then
+    cipher_pass="$(ask_secret "Encryption passphrase")"
+    warn "Keep this passphrase safe — backups are UNRECOVERABLE without it. Stored in $ENV_FILE."
+  fi
+
+  echo "Offsite backup pushes every backup + WAL to an S3-compatible bucket (defaults tuned for Cloudflare R2 EU)."
+  s3_enabled="$(ask "Enable offsite S3 backup? yes/no" "no")"
+  s3_bucket=""; s3_endpoint=""; s3_region="auto"; s3_key=""; s3_secret=""; s3_path="/pgbox"; s3_uri_style="path"; s3_keep_full="$full_keep"
+  if [[ "$s3_enabled" == "yes" ]]; then
+    s3_bucket="$(ask "S3 bucket" "")"; [[ -n "$s3_bucket" ]] || die "S3 bucket required."
+    s3_endpoint="$(ask "S3 endpoint, host only (R2 EU: <ACCOUNT_ID>.eu.r2.cloudflarestorage.com)" "")"; [[ -n "$s3_endpoint" ]] || die "S3 endpoint required."
+    s3_region="$(ask "S3 region" "auto")"
+    s3_key="$(ask "S3 access key id" "")"; [[ -n "$s3_key" ]] || die "S3 access key required."
+    s3_secret="$(ask_required_secret "S3 secret access key")"; [[ -n "$s3_secret" ]] || die "S3 secret required."
+    s3_path="$(ask "S3 path/prefix" "/pgbox")"
+    s3_uri_style="$(ask "S3 URI style: path (R2/S3-compatible) or host (AWS)" "path")"
+    s3_keep_full="$(ask "S3 full backup retention count" "$full_keep")"
+  fi
+
+  {
+    env_line PGBOX_CONTAINER_NAME "$CONTAINER_NAME_DEFAULT"
+    env_line POSTGRES_IMAGE "$pg_image"
+    env_line POSTGRES_DB "$db_name"
+    env_line POSTGRES_USER "$db_user"
+    env_line TZ "$tz"
+    env_line EXPOSE_MODE "$expose_mode"
+    env_line ALLOWED_IPS "$allowed_ips"
+    env_line PGBOX_PORT_BINDING "$port_binding"
+    env_line BACKUP_MODE "pgbackrest"
+    env_line BACKUP_KEEP_FULL "$full_keep"
+    env_line BACKUP_KEEP_DIFF "$diff_keep"
+    env_line POSTGRES_SHM_SIZE "$shm"
+    env_line PGBR_PROCESS_MAX "$pmax"
+    env_line PGBOX_UPDATE_URL "$update_url"
+    env_line S3_ENABLED "$s3_enabled"
+    env_line S3_BUCKET "$s3_bucket"
+    env_line S3_ENDPOINT "$s3_endpoint"
+    env_line S3_REGION "$s3_region"
+    env_line S3_KEY "$s3_key"
+    env_line S3_KEY_SECRET "$s3_secret"
+    env_line S3_PATH "$s3_path"
+    env_line S3_URI_STYLE "$s3_uri_style"
+    env_line S3_KEEP_FULL "$s3_keep_full"
+    env_line PGBR_ENCRYPT "$encrypt"
+    env_line PGBR_CIPHER_PASS "$cipher_pass"
+  } >"$ENV_FILE"
+  echo "$pg_password" >"$SECRETS_DIR/postgres_password"
+  chmod 600 "$ENV_FILE" "$SECRETS_DIR/postgres_password"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  write_dockerfile; write_postgres_conf; write_pgbackrest_conf; write_compose; write_info_file; write_state; write_cron; fix_perms; configure_firewall
+  info "Installed (backup schedule in /etc/cron.d/pgbox). Start with: pgbox start"
+}
+
+cmd_reconfigure() {
+  require_root; load_env
+  write_dockerfile; write_postgres_conf; write_pgbackrest_conf; write_compose; write_info_file; write_cron; fix_perms
+  info "Regenerated compose/config files (and /etc/cron.d/pgbox) from $ENV_FILE. Run: pgbox start"
+}
+
+cmd_start() {
+  require_root; load_env; cd "$APP_DIR"; docker compose up -d --build
+  info "Waiting for PostgreSQL health..."
+  for _ in {1..60}; do docker exec "$PGBOX_CONTAINER_NAME" pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 && break; sleep 2; done
+  docker exec "$PGBOX_CONTAINER_NAME" pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" || die "PostgreSQL did not become ready."
+  # stanza-create is idempotent enough with check fallback
+  pgbr --stanza=main stanza-create >/dev/null 2>&1 || true
+  pgbr --stanza=main check || warn "pgBackRest check failed. Run: pgbox doctor"
+  info "PostgreSQL ready."
+}
+cmd_stop() { require_root; load_env; cd "$APP_DIR"; docker compose down; }
+cmd_restart() { cmd_stop; cmd_start; }
+cmd_logs() { require_root; load_env; cd "$APP_DIR"; docker compose logs -f --tail=200 postgres; }
+cmd_shell() { require_root; load_env; docker exec -it "$PGBOX_CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"; }
+
+# Run pgbackrest as the postgres uid so the lock/stop path (/tmp/pgbackrest) and repo
+# files have a single owner — archive_command runs as this user too.
+pgbr() { docker exec -u "$PG_UID" "$PGBOX_CONTAINER_NAME" pgbackrest "$@"; }
+pg_sql() { docker exec "$PGBOX_CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "$1" 2>/dev/null || true; }
+container_running() { docker inspect -f '{{.State.Running}}' "$PGBOX_CONTAINER_NAME" 2>/dev/null | grep -q true; }
+
+cmd_info() {
+  require_root; load_env
+  bold "PGBOX INFO"
+  echo "Version:        $PGBOX_VERSION"
+  echo "App dir:        $APP_DIR"
+  echo "Container:      $PGBOX_CONTAINER_NAME"
+  echo "Image:          $POSTGRES_IMAGE"
+  echo "Database:       $POSTGRES_DB"
+  echo "User:           $POSTGRES_USER"
+  echo "Expose mode:    $EXPOSE_MODE"
+  echo "Allowed IPs:    ${ALLOWED_IPS:-localhost only}"
+  echo "Backup mode:    $BACKUP_MODE"
+  echo "Full retention: $BACKUP_KEEP_FULL"
+  echo "Diff retention: $BACKUP_KEEP_DIFF"
+  if [[ "$S3_ENABLED" == "yes" ]]; then echo "Offsite S3:     ${S3_BUCKET:-?} @ ${S3_ENDPOINT:-?}"; else echo "Offsite S3:     disabled"; fi
+  if [[ "$PGBR_ENCRYPT" == "yes" ]]; then echo "Encryption:     aes-256-cbc"; else echo "Encryption:     disabled"; fi
+  if [[ -f /etc/cron.d/pgbox ]]; then echo "Schedule:       /etc/cron.d/pgbox (weekly full, daily diff, hourly incr)"; else echo "Schedule:       none (no /etc/cron.d/pgbox)"; fi
+  echo
+  if container_running; then
+    echo "Postgres:       running"
+    echo "Health:         $(docker inspect -f '{{.State.Health.Status}}' "$PGBOX_CONTAINER_NAME" 2>/dev/null || echo unknown)"
+    echo "DB size:        $(pg_sql "select pg_size_pretty(pg_database_size('$POSTGRES_DB'))")"
+    echo "Connections:    $(pg_sql "select count(*) from pg_stat_activity")"
+    echo "Version SQL:    $(pg_sql "select split_part(version(), ',', 1)")"
+    echo
+    echo "pgBackRest latest info:"
+    pgbr --stanza=main info || true
+  else
+    echo "Postgres:       stopped"
+  fi
+}
+
+cmd_doctor() {
+  require_root; load_env
+  local fail=0
+  bold "PGBOX DOCTOR"
+  if container_running; then echo "✓ container running"; else echo "✗ container not running"; fail=1; fi
+  if container_running && docker exec "$PGBOX_CONTAINER_NAME" pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null; then echo "✓ postgres ready"; else echo "✗ postgres not ready"; fail=1; fi
+  if systemctl is-active --quiet docker; then echo "✓ docker service active"; else echo "✗ docker service inactive"; fail=1; fi
+  if ufw status | grep -q "Status: active"; then echo "✓ ufw active"; else echo "⚠ ufw inactive"; fi
+  local used; used=$(df -P "$APP_DIR" | awk 'NR==2 {print $5}' | tr -d '%')
+  if [[ "$used" -lt 85 ]]; then echo "✓ disk usage ${used}%"; else echo "✗ disk usage ${used}%"; fail=1; fi
+  if container_running && pgbr --stanza=main check >/dev/null 2>&1; then echo "✓ pgBackRest check passed"; else echo "✗ pgBackRest check failed"; fail=1; fi
+  echo
+  [[ "$fail" -eq 0 ]] && echo "Result: PASS" || echo "Result: ISSUES FOUND"
+  return "$fail"
+}
+
+cmd_backup() {
+  require_root; load_env
+  local type="${1:-diff}"
+  [[ "$type" =~ ^(full|diff|incr)$ ]] || die "Usage: pgbox backup full|diff|incr"
+  pgbr --stanza=main --type="$type" backup
+}
+cmd_backups() { require_root; load_env; pgbr --stanza=main info; }
+
+cmd_restore() {
+  require_root; load_env
+  local mode="${1:-}" arg="" repo=""
+  shift || true
+  # remaining args: optional timestamp (for time mode) and optional --repo N
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo="${2:-}"; [[ "$repo" =~ ^[0-9]+$ ]] || die "--repo must be a number (e.g. 1 or 2)."; shift 2 ;;
+      *) arg="$1"; shift ;;
+    esac
+  done
+  [[ "$mode" == "latest" || "$mode" == "time" ]] || die "Usage: pgbox restore latest [--repo N] | pgbox restore time 'YYYY-MM-DD HH:MM:SS' [--repo N]"
+  [[ "$mode" == "latest" || -n "$arg" ]] || die "Missing restore timestamp."
+  confirm_or_die "RESTORE" "This stops PostgreSQL and replaces data."
+  cd "$APP_DIR"
+  docker compose down
+  mkdir -p "$APP_DIR/restore-old"
+  if [[ -d "$DATA_DIR" ]]; then mv "$DATA_DIR" "$APP_DIR/restore-old/data-$(date +%Y%m%d-%H%M%S)"; fi
+  mkdir -p "$DATA_DIR"; chown "$PG_UID:$PG_UID" "$DATA_DIR"
+  local opts=""
+  [[ "$mode" == "time" ]] && opts+=" $(printf -- '--type=time --target=%q' "$arg")"
+  [[ -n "$repo" ]] && opts+=" --repo=$repo"
+  docker compose run --rm --user "$PG_UID" postgres bash -lc "pgbackrest --stanza=main restore$opts"
+  docker compose up -d
+  info "Restore requested. Run: pgbox doctor"
+}
+
+# --- database / user / permission management (thin psql wrappers, run as the superuser) ---
+valid_ident() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "Invalid name '$1': use letters, digits, underscore; must not start with a digit."; }
+# Reads SQL from stdin against <db>; keeps passwords out of the process args.
+psql_sql() { docker exec -i "$PGBOX_CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$1" -v ON_ERROR_STOP=1 -qAt -f -; }
+sql_quote() { printf "%s" "$1" | sed "s/'/''/g"; }
+
+cmd_db() {
+  require_root; load_env
+  local action="${1:-list}"; shift || true
+  case "$action" in
+    list) psql_sql postgres <<<"select datname from pg_database where datistemplate=false order by 1;" ;;
+    create)
+      local name="${1:?Usage: pgbox db create <name> [owner]}" owner="${2:-}"
+      valid_ident "$name"; [[ -z "$owner" ]] || valid_ident "$owner"
+      if [[ -n "$owner" ]]; then psql_sql postgres <<<"create database \"$name\" owner \"$owner\";"; else psql_sql postgres <<<"create database \"$name\";"; fi
+      info "Database $name created." ;;
+    drop)
+      local name="${1:?Usage: pgbox db drop <name>}"; valid_ident "$name"
+      confirm_or_die "DROP-DB" "This permanently deletes database '$name' and all its data."
+      psql_sql postgres <<<"drop database \"$name\";"
+      info "Database $name dropped." ;;
+    *) die "Usage: pgbox db list|create|drop" ;;
+  esac
+}
+
+cmd_user() {
+  require_root; load_env
+  local action="${1:-list}"; shift || true
+  case "$action" in
+    list) psql_sql postgres <<<"select rolname from pg_roles where rolname not like 'pg\_%' order by 1;" ;;
+    create)
+      local name="${1:?Usage: pgbox user create <name> [--super]}"; valid_ident "$name"
+      local super=""; [[ "${2:-}" == "--super" ]] && super=" superuser"
+      local pw; pw="$(ask_secret "Password for $name")"
+      psql_sql postgres <<<"create role \"$name\" login${super} password '$(sql_quote "$pw")';"
+      info "User $name created." ;;
+    password)
+      local name="${1:?Usage: pgbox user password <name>}"; valid_ident "$name"
+      local pw; pw="$(ask_secret "New password for $name")"
+      psql_sql postgres <<<"alter role \"$name\" password '$(sql_quote "$pw")';"
+      info "Password updated for $name." ;;
+    drop)
+      local name="${1:?Usage: pgbox user drop <name>}"; valid_ident "$name"
+      confirm_or_die "DROP-USER" "This deletes role '$name'."
+      psql_sql postgres <<<"drop role \"$name\";"
+      info "User $name dropped." ;;
+    *) die "Usage: pgbox user list|create|drop|password" ;;
+  esac
+}
+
+cmd_grant() {
+  require_root; load_env
+  local user="${1:?Usage: pgbox grant <user> <db> [ro|rw|all]}" db="${2:?Usage: pgbox grant <user> <db> [ro|rw|all]}" level="${3:-rw}"
+  valid_ident "$user"; valid_ident "$db"
+  local base="grant connect on database \"$db\" to \"$user\"; grant usage on schema public to \"$user\";"
+  case "$level" in
+    ro)  psql_sql "$db" <<<"$base grant select on all tables in schema public to \"$user\"; alter default privileges in schema public grant select on tables to \"$user\";" ;;
+    rw)  psql_sql "$db" <<<"$base grant create on schema public to \"$user\"; grant select,insert,update,delete on all tables in schema public to \"$user\"; grant usage,select on all sequences in schema public to \"$user\"; alter default privileges in schema public grant select,insert,update,delete on tables to \"$user\"; alter default privileges in schema public grant usage,select on sequences to \"$user\";" ;;
+    all) psql_sql "$db" <<<"grant all privileges on database \"$db\" to \"$user\"; grant all on schema public to \"$user\"; grant all on all tables in schema public to \"$user\"; alter default privileges in schema public grant all on tables to \"$user\";" ;;
+    *) die "Usage: pgbox grant <user> <db> [ro|rw|all]" ;;
+  esac
+  info "Granted $level on $db to $user."
+}
+
+cmd_restore_test() {
+  require_root; load_env
+  warn "restore-test for full pgBackRest clones is intentionally conservative in v$PGBOX_VERSION."
+  warn "Use a disposable VM/container host and run: pgbox restore latest"
+}
+
+cmd_update() {
+  require_root; load_env; cd "$APP_DIR"
+  info "Creating safety diff backup before update..."
+  pgbr --stanza=main --type=diff backup || warn "Safety backup failed; continuing not recommended."
+  confirm_or_die "UPDATE" "Pull/rebuild and restart PostgreSQL."
+  docker compose pull || true
+  docker compose build --pull postgres
+  docker compose up -d
+  docker image prune -f
+}
+
+cmd_self_update() {
+  require_root; load_env
+  [[ -n "$PGBOX_UPDATE_URL" ]] || die "PGBOX_UPDATE_URL is not configured in $ENV_FILE"
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$PGBOX_UPDATE_URL" -o "$tmp"
+  bash -n "$tmp" || die "Downloaded script failed syntax check."
+  install -m 0755 "$tmp" "$BIN_PATH"
+  rm -f "$tmp"
+  info "pgbox updated at $BIN_PATH"
+}
+
+urlencode() {
+  local s="$1" o="" c i
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in [a-zA-Z0-9.~_-]) o+="$c" ;; *) printf -v c '%%%02X' "'$c"; o+="$c" ;; esac
+  done
+  printf '%s' "$o"
+}
+
+# Print TablePlus/DBeaver/psql-ready connection URIs. Optional arg overrides the database.
+cmd_url() {
+  require_root; load_env
+  local db="${1:-$POSTGRES_DB}" pass host ssh_user
+  pass="$(urlencode "$(cat "$SECRETS_DIR/postgres_password")")"
+  # ponytail: external lookup with local fallback; SERVER_IP placeholder if both fail
+  host="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  host="${host:-SERVER_IP}"
+  ssh_user="${SUDO_USER:-root}"
+  bold "PGBOX CONNECTION URLS ($db)"
+  echo "Local / SSH tunnel:"
+  echo "  postgresql://$POSTGRES_USER:$pass@127.0.0.1:5432/$db"
+  echo
+  echo "TablePlus (SSH tunnel, import as URL):"
+  echo "  postgresql+ssh://$ssh_user@$host/$POSTGRES_USER:$pass@127.0.0.1/$db?statusColor=007F3D&name=$(urlencode "pgbox $db@$(hostname)")&tLSMode=0&usePrivateKey=true&safeModeLevel=0&advancedSafeModeLevel=0&driverVersion=0&lazyload=false"
+  if [[ "${EXPOSE_MODE:-1}" == "2" ]]; then
+    echo
+    echo "Direct (port exposed):"
+    echo "  postgresql://$POSTGRES_USER:$pass@$host:5432/$db"
+  else
+    echo
+    echo "Port is localhost-only. From your machine, tunnel first:"
+    echo "  ssh -N -L 5432:127.0.0.1:5432 $ssh_user@$host"
+  fi
+}
+
+cmd_config_show() { require_root; load_env; sed 's/=.*/=<hidden where relevant>/' "$ENV_FILE"; echo "Secret: $SECRETS_DIR/postgres_password"; }
+cmd_config_edit() { require_root; ${EDITOR:-nano} "$ENV_FILE"; }
+cmd_secrets() { require_root; echo "Postgres password file: $SECRETS_DIR/postgres_password"; }
+
+cmd_help() {
+  cat <<'EOS'
+PGBOX COMMANDS
+==============
+
+Install/setup:
+  pgbox install                 Interactive Debian/Ubuntu install
+  pgbox start                   Build/start PostgreSQL and initialize pgBackRest stanza
+  pgbox stop                    Stop container
+  pgbox restart                 Restart container
+  pgbox reconfigure             Regenerate compose/config from .env (no data touched)
+
+Status/docs:
+  pgbox info                    Current configuration, state, backup info
+  pgbox doctor                  Health/security/backup checks
+  pgbox logs                    Follow PostgreSQL logs
+  pgbox help                    Show this help
+
+Database:
+  pgbox shell                   Open psql
+  pgbox url [db]                Print connection URLs (TablePlus/DBeaver/psql)
+  pgbox db list                 List databases
+  pgbox db create <name> [owner]  Create a database
+  pgbox db drop <name>          Drop a database (destructive)
+
+Users/permissions:
+  pgbox user list               List roles
+  pgbox user create <name> [--super]   Create a login role (prompts for password)
+  pgbox user password <name>    Change a role's password
+  pgbox user drop <name>        Drop a role
+  pgbox grant <user> <db> [ro|rw|all]  Grant access on a database (default rw)
+
+Backups with pgBackRest:
+  pgbox backup full             Full backup
+  pgbox backup diff             Differential backup
+  pgbox backup incr             Incremental backup
+  pgbox backups                 Show pgBackRest backup sets and WAL status
+
+Restore:
+  pgbox restore latest [--repo N]   Restore latest consistent backup (N selects repo, e.g. 2 = offsite)
+  pgbox restore time "YYYY-MM-DD HH:MM:SS" [--repo N]
+                               Point-in-time restore
+  pgbox restore-test            Placeholder safety note for disposable restore tests
+
+Updates:
+  pgbox update                  Safety backup, rebuild/pull image, restart
+  pgbox self-update             Replace pgbox from PGBOX_UPDATE_URL
+
+Config/secrets:
+  pgbox config show             Show config locations
+  pgbox config edit             Edit /opt/pgbox/.env
+  pgbox secrets                 Show secret file locations, not values
+EOS
+}
+
+case "${1:-help}" in
+  install) cmd_install ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  reconfigure) cmd_reconfigure ;;
+  status|info) cmd_info ;;
+  doctor) cmd_doctor ;;
+  logs) cmd_logs ;;
+  shell) cmd_shell ;;
+  url) shift; cmd_url "${1:-}" ;;
+  db) shift; cmd_db "$@" ;;
+  user) shift; cmd_user "$@" ;;
+  grant) shift; cmd_grant "$@" ;;
+  backup) shift; cmd_backup "${1:-diff}" ;;
+  backups) cmd_backups ;;
+  restore) shift; cmd_restore "$@" ;;
+  restore-test) cmd_restore_test ;;
+  update) cmd_update ;;
+  self-update) cmd_self_update ;;
+  config) shift; case "${1:-show}" in show) cmd_config_show ;; edit) cmd_config_edit ;; *) die "Usage: pgbox config show|edit" ;; esac ;;
+  secrets) cmd_secrets ;;
+  help|-h|--help) cmd_help ;;
+  *) die "Unknown command: $1. Run: pgbox help" ;;
+esac
